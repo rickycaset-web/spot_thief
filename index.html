@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spot Thief</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/exifr@7/dist/full.umd.js"></script>
+<style>
+  :root { --bg:#0f1720; --panel:#16212d; --line:#263545; --txt:#e6edf3; --mut:#8aa0b4; --acc:#3fb6a8; --warn:#e3a23c; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--txt); }
+  header { padding:16px 20px 8px; }
+  h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; color:var(--mut); }
+  main { display:grid; grid-template-columns: minmax(360px, 1fr) 1.2fr; gap:14px; padding:12px 20px 20px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px; }
+  #drop { border:2px dashed var(--line); border-radius:10px; padding:26px 12px; text-align:center; cursor:pointer; transition:.15s; }
+  #drop.over { border-color:var(--acc); background:#1b2c38; }
+  #drop b { color:var(--acc); }
+  .row { display:flex; gap:8px; margin-top:10px; flex-wrap:wrap; }
+  input[type=url] { flex:1; min-width:180px; padding:8px; border-radius:6px; border:1px solid var(--line); background:#0d141b; color:var(--txt); }
+  button { padding:8px 12px; border-radius:6px; border:1px solid var(--line); background:#203041; color:var(--txt); cursor:pointer; }
+  button:hover { border-color:var(--acc); }
+  button.primary { background:var(--acc); color:#06201d; border-color:var(--acc); font-weight:600; }
+  #stats { color:var(--mut); margin-top:10px; }
+  #map { height: 560px; border-radius:10px; border:1px solid var(--line); }
+  .list { margin-top:12px; max-height:460px; overflow:auto; }
+  .card { border-top:1px solid var(--line); padding:10px 2px; }
+  .card .name { font-weight:600; word-break:break-all; cursor:pointer; }
+  .card .coord { font-family: ui-monospace, Consolas, monospace; color:var(--acc); }
+  .card .meta { color:var(--mut); }
+  .card .err { color:var(--warn); }
+  .card a { color:#7fc8ff; }
+  .mini { padding:2px 8px; font-size:12px; margin-left:6px; }
+  footer { color:var(--mut); padding:0 20px 20px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>📍 Spot Thief</h1>
+  <p>Trascina le foto: estrae coordinate GPS, data/ora di scatto e dispositivo dai metadati EXIF. Tutto avviene nel browser, le foto non vengono caricate da nessuna parte.</p>
+</header>
+
+<main>
+  <section class="panel">
+    <div id="drop">
+      <div style="font-size:28px">🖼️</div>
+      <div><b>Trascina qui le foto</b> o clicca per sceglierle</div>
+      <div style="color:var(--mut);font-size:12px;margin-top:4px">JPG, HEIC, TIFF, PNG, WebP — anche molte insieme</div>
+      <input id="file" type="file" multiple accept="image/*,.heic,.heif" hidden>
+    </div>
+
+    <div class="row">
+      <input id="url" type="url" placeholder="…oppure incolla l'URL di una foto (può essere bloccato dal sito)">
+      <button id="addUrl">Aggiungi</button>
+    </div>
+
+    <div class="row">
+      <button class="primary" id="csv">⬇ CSV</button>
+      <button id="kml">⬇ KML (My Maps / Earth)</button>
+      <button id="geojson">⬇ GeoJSON</button>
+      <button id="copy">📋 Copia coordinate</button>
+      <button id="clear">🗑 Svuota</button>
+    </div>
+    <div id="stats">Nessuna foto caricata.</div>
+    <div class="list" id="list"></div>
+  </section>
+
+  <section>
+    <div id="map"></div>
+  </section>
+</main>
+
+<footer>
+  Suggerimento: i social (Instagram, Facebook, WhatsApp) cancellano i metadati. Funziona con i file originali (siti, blog, Flickr, foto mandate "come file").
+</footer>
+
+<script>
+const GIORNI = ['domenica','lunedì','martedì','mercoledì','giovedì','venerdì','sabato'];
+const rows = [];
+const markers = [];
+
+// ---------- mappa
+const map = L.map('map').setView([45.3, 13], 7);
+const sat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19, attribution: 'Esri' });
+const osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' });
+const sea = L.tileLayer('https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png', { maxZoom: 18, attribution: 'OpenSeaMap' });
+sat.addTo(map);
+L.control.layers({ 'Satellite': sat, 'Mappa': osm }, { 'Segnali nautici': sea }).addTo(map);
+const group = L.featureGroup().addTo(map);
+
+// ---------- utilità
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const pad = n => String(n).padStart(2, '0');
+const fmtDate = d => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+
+async function parse(blob, source) {
+  const r = { source };
+  try {
+    const x = await exifr.parse(blob, { tiff: true, exif: true, gps: true, xmp: false, icc: false, iptc: false });
+    if (!x) { r.error = 'nessun metadato EXIF'; return r; }
+    r.make = x.Make; r.model = x.Model; r.lens = x.LensModel;
+    const dt = x.DateTimeOriginal || x.CreateDate || x.ModifyDate;
+    if (dt instanceof Date && !isNaN(dt)) { r.datetime_local = fmtDate(dt); r.weekday = GIORNI[dt.getDay()]; }
+    r.utc_offset = x.OffsetTimeOriginal || x.OffsetTime;
+    if (typeof x.latitude === 'number' && typeof x.longitude === 'number') {
+      r.latitude = +x.latitude.toFixed(6); r.longitude = +x.longitude.toFixed(6);
+      r.maps_url = `https://www.google.com/maps?q=${r.latitude},${r.longitude}`;
+    }
+    if (typeof x.GPSAltitude === 'number') r.altitude_m = +((x.GPSAltitudeRef === 1 ? -1 : 1) * x.GPSAltitude).toFixed(1);
+    if (typeof x.GPSSpeed === 'number') {
+      const f = { K: 1, M: 1.609344, N: 1.852 }[x.GPSSpeedRef || 'K'] || 1;
+      r.speed_kmh = +(x.GPSSpeed * f).toFixed(1);
+    }
+    if (typeof x.GPSImgDirection === 'number') r.direction_deg = +x.GPSImgDirection.toFixed(1);
+    if (r.latitude == null) r.error = 'EXIF presente ma senza GPS';
+  } catch (e) {
+    r.error = 'errore lettura: ' + (e.message || e);
+  }
+  return r;
+}
+
+function render() {
+  rows.sort((a, b) => (a.datetime_local || '9999').localeCompare(b.datetime_local || '9999'));
+  group.clearLayers(); markers.length = 0;
+  const list = document.getElementById('list');
+  list.innerHTML = '';
+  let n = 0;
+  rows.forEach(r => {
+    let mk = null;
+    if (r.latitude != null) {
+      n++;
+      mk = L.marker([r.latitude, r.longitude]).bindPopup(
+        `<b>${n}. ${esc(r.source)}</b><br>${esc(r.weekday || '')} ${esc(r.datetime_local || '')}<br>` +
+        `<a href="${esc(r.maps_url)}" target="_blank">Google Maps</a>`).bindTooltip(String(n), { permanent: true, direction: 'top', offset: [-15, -10] });
+      group.addLayer(mk);
+    }
+    markers.push(mk);
+    const el = document.createElement('div');
+    el.className = 'card';
+    el.innerHTML =
+      `<div class="name">${r.latitude != null ? n + '. ' : ''}${esc(r.source)}</div>` +
+      (r.latitude != null ? `<div><span class="coord">${r.latitude}, ${r.longitude}</span>
+        <button class="mini" data-c="${r.latitude}, ${r.longitude}">copia</button>
+        <a href="${esc(r.maps_url)}" target="_blank">Maps ↗</a></div>` : '') +
+      `<div class="meta">` +
+        (r.datetime_local ? `🕒 ${esc(r.weekday)} ${esc(r.datetime_local)}${r.utc_offset ? ' (' + esc(r.utc_offset) + ')' : ''}` : '') +
+        (r.altitude_m != null ? ` · alt ${r.altitude_m} m` : '') +
+        (r.speed_kmh != null ? ` · ${r.speed_kmh} km/h` : '') +
+        (r.direction_deg != null ? ` · dir ${r.direction_deg}°` : '') +
+        ((r.make || r.model) ? `<br>📱 ${esc([r.make, r.model].filter(Boolean).join(' '))}` : '') +
+      `</div>` +
+      (r.error ? `<div class="err">⚠️ ${esc(r.error)}</div>` : '');
+    if (mk) el.querySelector('.name').onclick = () => { map.setView(mk.getLatLng(), 14); mk.openPopup(); };
+    list.appendChild(el);
+  });
+  list.querySelectorAll('button[data-c]').forEach(b => b.onclick = () => navigator.clipboard.writeText(b.dataset.c));
+  if (n) map.fitBounds(group.getBounds().pad(0.3), { maxZoom: 14 });
+  document.getElementById('stats').textContent = rows.length ? `${rows.length} foto, ${n} con GPS.` : 'Nessuna foto caricata.';
+}
+
+async function addFiles(files) {
+  for (const f of files) rows.push(await parse(f, f.name));
+  render();
+}
+
+// ---------- input
+const drop = document.getElementById('drop'), fileIn = document.getElementById('file');
+drop.onclick = () => fileIn.click();
+fileIn.onchange = () => { addFiles([...fileIn.files]); fileIn.value = ''; };
+['dragenter', 'dragover'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', ev => addFiles([...ev.dataTransfer.files].filter(f => f.type.startsWith('image/') || /\.(heic|heif)$/i.test(f.name))));
+
+document.getElementById('addUrl').onclick = async () => {
+  const u = document.getElementById('url').value.trim();
+  if (!u) return;
+  try {
+    const res = await fetch(u);
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    rows.push(await parse(await res.blob(), u));
+  } catch (e) {
+    rows.push({ source: u, error: 'download bloccato (probabile CORS): salva la foto e trascinala, o usa lo script Python' });
+  }
+  document.getElementById('url').value = '';
+  render();
+};
+
+// ---------- export
+const gps = () => rows.filter(r => r.latitude != null);
+function download(name, text, type) {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type }));
+  a.download = name; a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+}
+const COLS = ['source','latitude','longitude','altitude_m','datetime_local','utc_offset','weekday','speed_kmh','direction_deg','make','model','lens','maps_url','error'];
+document.getElementById('csv').onclick = () => {
+  const q = v => v == null ? '' : /[",\n;]/.test(String(v)) ? `"${String(v).replace(/"/g, '""')}"` : String(v);
+  const csv = [COLS.join(','), ...rows.map(r => COLS.map(c => q(r[c])).join(','))].join('\n');
+  download('foto_gps.csv', '﻿' + csv, 'text/csv');
+};
+document.getElementById('kml').onclick = () => {
+  const pm = gps().map((r, i) => {
+    const when = r.datetime_local ? `<TimeStamp><when>${r.datetime_local.replace(' ', 'T')}${r.utc_offset || ''}</when></TimeStamp>` : '';
+    const desc = [r.weekday && `${r.weekday} ${r.datetime_local}`, r.altitude_m != null && `alt ${r.altitude_m} m`, [r.make, r.model].filter(Boolean).join(' '), r.source].filter(Boolean).join(' | ');
+    return `<Placemark><name>${i + 1}. ${esc(r.source)}</name><description>${esc(desc)}</description>${when}<Point><coordinates>${r.longitude},${r.latitude},${r.altitude_m || 0}</coordinates></Point></Placemark>`;
+  }).join('\n');
+  download('foto_gps.kml', `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>Foto geolocalizzate</name>\n${pm}\n</Document></kml>`, 'application/vnd.google-earth.kml+xml');
+};
+document.getElementById('geojson').onclick = () => {
+  const fc = { type: 'FeatureCollection', features: gps().map(r => ({ type: 'Feature', geometry: { type: 'Point', coordinates: [r.longitude, r.latitude] }, properties: r })) };
+  download('foto_gps.geojson', JSON.stringify(fc, null, 2), 'application/geo+json');
+};
+document.getElementById('copy').onclick = () =>
+  navigator.clipboard.writeText(gps().map(r => `${r.latitude}, ${r.longitude}\t${r.datetime_local || ''}\t${r.source}`).join('\n'));
+document.getElementById('clear').onclick = () => { rows.length = 0; render(); };
+</script>
+</body>
+</html>
